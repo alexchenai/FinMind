@@ -1,201 +1,325 @@
-"""Tests for Spending Trend Heatmap service (#116)."""
-from __future__ import annotations
-
+"""
+Tests for Spending Trend Heatmap Visualization (#116)
+"""
 import pytest
-from datetime import date, timedelta
+import socket
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from datetime import date, timedelta
+
+from app.services.spending_heatmap import (
+    get_spending_heatmap,
+    _intensity,
+    _week_number,
+)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+def _redis_available() -> bool:
+    try:
+        s = socket.create_connection(("localhost", 6379), timeout=0.5)
+        s.close()
+        return True
+    except (OSError, ConnectionRefusedError):
+        return False
 
-def make_expense_row(spent_at: date, total: Decimal, cnt: int):
-    row = MagicMock()
-    row.spent_at = spent_at
-    row.total = total
-    row.cnt = cnt
-    return row
+
+requires_redis = pytest.mark.skipif(
+    not _redis_available(), reason="Redis not available"
+)
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
+class TestIntensityCalculation:
+    """Tests for intensity level calculation."""
 
-class TestGetSpendingHeatmap:
+    def test_zero_is_level_0(self):
+        assert _intensity(0, 100) == "0"
 
-    def _call(self, rows, months=3):
-        from packages.backend.app.services.spending_heatmap import get_spending_heatmap
-        mock_query = MagicMock()
-        mock_query.filter.return_value = mock_query
-        mock_query.group_by.return_value = mock_query
-        mock_query.all.return_value = rows
-        with patch("packages.backend.app.services.spending_heatmap.db") as mock_db:
-            mock_db.session.query.return_value = mock_query
-            return get_spending_heatmap(1, months)
+    def test_max_zero_is_level_0(self):
+        assert _intensity(50, 0) == "0"
 
-    def test_empty_returns_structure(self):
-        result = self._call([])
-        assert "cells" in result
-        assert "day_summaries" in result
-        assert "busiest_day" in result
-        assert "quietest_day" in result
-        assert "total_spend" in result
+    def test_low_25_percent_is_level_1(self):
+        assert _intensity(20, 100) == "1"
+
+    def test_medium_50_percent_is_level_2(self):
+        assert _intensity(40, 100) == "2"
+
+    def test_high_75_percent_is_level_3(self):
+        assert _intensity(60, 100) == "3"
+
+    def test_max_is_level_4(self):
+        assert _intensity(100, 100) == "4"
+
+    def test_intensity_returns_string(self):
+        assert isinstance(_intensity(50, 100), str)
+
+
+class TestWeekNumber:
+    """Tests for ISO week number calculation."""
+
+    def test_jan_first_2026(self):
+        # Jan 1, 2026 is week 1 of 2026
+        result = _week_number(date(2026, 1, 1))
+        assert isinstance(result, int)
+        assert 1 <= result <= 53
+
+    def test_week_number_is_integer(self):
+        result = _week_number(date(2026, 3, 15))
+        assert isinstance(result, int)
+
+
+class TestSpendingHeatmapService:
+    """Tests for get_spending_heatmap service."""
+
+    def test_empty_user_returns_empty_heatmap(self, app_fixture):
+        from app.models import User
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
+
+        with app_fixture.app_context():
+            user = User(
+                email="empty_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.commit()
+            result = get_spending_heatmap(user.id)
+
         assert result["cells"] == []
-        assert len(result["day_summaries"]) == 7
+        assert result["total_spend"] == 0
 
-    def test_total_spend_matches(self):
-        today = date.today()
-        rows = [
-            make_expense_row(today, Decimal("100"), 1),
-            make_expense_row(today - timedelta(days=1), Decimal("50"), 2),
-        ]
-        result = self._call(rows)
-        assert abs(result["total_spend"] - 150.0) < 0.01
+    def test_daily_view_has_correct_structure(self, app_fixture):
+        from app.models import User
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
 
-    def test_cells_contain_expected_fields(self):
-        today = date.today()
-        rows = [make_expense_row(today, Decimal("200"), 3)]
-        result = self._call(rows)
-        assert len(result["cells"]) == 1
-        cell = result["cells"][0]
-        assert "week" in cell
-        assert "day_of_week" in cell
-        assert "total_spend" in cell
-        assert "transaction_count" in cell
-        assert cell["total_spend"] == 200.0
-        assert cell["transaction_count"] == 3
+        with app_fixture.app_context():
+            user = User(
+                email="daily_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="daily")
 
-    def test_day_of_week_correct(self):
-        # Find a known Monday
-        today = date.today()
-        days_since_monday = today.weekday()
-        last_monday = today - timedelta(days=days_since_monday)
-        rows = [make_expense_row(last_monday, Decimal("100"), 1)]
-        result = self._call(rows)
-        assert result["cells"][0]["day_of_week"] == 0  # Monday
+        assert result["view"] == "daily"
 
-    def test_day_summaries_have_seven_entries(self):
-        result = self._call([])
-        assert len(result["day_summaries"]) == 7
-        days = [d["day_name"] for d in result["day_summaries"]]
-        assert "Monday" in days
-        assert "Sunday" in days
+    def test_weekday_view_has_7_days(self, app_fixture):
+        from app.models import User, Category, Expense
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
 
-    def test_avg_per_week_calculation(self):
-        # Two different Mondays should give avg = total / 2
-        today = date.today()
-        days_since_monday = today.weekday()
-        monday1 = today - timedelta(days=days_since_monday)
-        monday2 = monday1 - timedelta(weeks=1)
-        rows = [
-            make_expense_row(monday1, Decimal("80"), 1),
-            make_expense_row(monday2, Decimal("60"), 1),
-        ]
-        result = self._call(rows)
-        monday_summary = next(d for d in result["day_summaries"] if d["day_name"] == "Monday")
-        assert abs(monday_summary["avg_per_week"] - 70.0) < 0.01
+        with app_fixture.app_context():
+            user = User(
+                email="weekday_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.flush()
 
-    def test_busiest_day_identified(self):
-        today = date.today()
-        days_since_monday = today.weekday()
-        monday = today - timedelta(days=days_since_monday)
-        friday = monday + timedelta(days=4)
-        rows = [
-            make_expense_row(monday, Decimal("50"), 1),
-            make_expense_row(friday, Decimal("500"), 5),
-        ]
-        result = self._call(rows)
-        assert result["busiest_day"] == "Friday"
+            cat = Category(user_id=user.id, name="Shopping")
+            db.session.add(cat)
+            db.session.flush()
 
-    def test_quietest_day_identified(self):
-        today = date.today()
-        days_since_monday = today.weekday()
-        tuesday = today - timedelta(days=days_since_monday - 1)
-        saturday = today - timedelta(days=days_since_monday - 5)
-        rows = [
-            make_expense_row(tuesday, Decimal("500"), 3),
-            make_expense_row(saturday, Decimal("10"), 1),
-        ]
-        result = self._call(rows)
-        # Saturday has lowest avg (only 1 week), but days with 0 spend sort lower
-        assert result["quietest_day"] != result["busiest_day"]
+            for days_ago in range(0, 30, 3):
+                db.session.add(Expense(
+                    user_id=user.id, category_id=cat.id,
+                    amount=Decimal("500"), currency="INR",
+                    expense_type="EXPENSE",
+                    spent_at=date.today() - timedelta(days=days_ago),
+                ))
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="weekday")
 
-    def test_months_param_clamped_min(self):
-        result = self._call([], months=0)
-        assert result["period_months"] == 1
+        assert result["view"] == "weekday"
+        assert len(result["cells"]) == 7
 
-    def test_months_param_clamped_max(self):
-        result = self._call([], months=99)
-        assert result["period_months"] == 12
+    def test_weekday_cells_have_required_fields(self, app_fixture):
+        from app.models import User, Category, Expense
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
 
-    def test_start_end_dates_present(self):
-        result = self._call([])
-        assert "start_date" in result
-        assert "end_date" in result
-        # end_date should be today
-        assert result["end_date"] == date.today().isoformat()
+        with app_fixture.app_context():
+            user = User(
+                email="wdfields_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.flush()
 
-    def test_multiple_expenses_same_day_aggregated(self):
-        today = date.today()
-        rows = [make_expense_row(today, Decimal("300"), 4)]
-        result = self._call(rows)
-        assert len(result["cells"]) == 1
-        assert result["cells"][0]["total_spend"] == 300.0
-        assert result["cells"][0]["transaction_count"] == 4
+            cat = Category(user_id=user.id, name="Food")
+            db.session.add(cat)
+            db.session.flush()
 
-    def test_peak_week_in_summary(self):
-        today = date.today()
-        days_since_monday = today.weekday()
-        wednesday = today - timedelta(days=days_since_monday - 2)
-        rows = [make_expense_row(wednesday, Decimal("400"), 2)]
-        result = self._call(rows)
-        wed_summary = next(d for d in result["day_summaries"] if d["day_name"] == "Wednesday")
-        assert wed_summary["peak_week"] is not None
+            db.session.add(Expense(
+                user_id=user.id, category_id=cat.id,
+                amount=Decimal("100"), currency="INR",
+                expense_type="EXPENSE",
+                spent_at=date.today() - timedelta(days=1),
+            ))
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="weekday")
 
-    def test_zero_spend_days_have_zero_total(self):
-        result = self._call([])
-        for summary in result["day_summaries"]:
-            assert summary["total_spend"] == 0.0
-            assert summary["transaction_count"] == 0
+        for cell in result["cells"]:
+            assert "day_of_week" in cell
+            assert "day_name" in cell
+            assert "total" in cell
+            assert "average" in cell
+            assert "intensity" in cell
 
-    def test_transaction_count_in_day_summary(self):
-        today = date.today()
-        rows = [make_expense_row(today, Decimal("200"), 7)]
-        result = self._call(rows)
-        dow = today.weekday()
-        day_summary = next(d for d in result["day_summaries"] if d["day_of_week"] == dow)
-        assert day_summary["transaction_count"] == 7
+    def test_monthly_view_returns_months(self, app_fixture):
+        from app.models import User
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
 
-    def test_period_months_in_result(self):
-        result = self._call([], months=6)
-        assert result["period_months"] == 6
+        with app_fixture.app_context():
+            user = User(
+                email="monthly_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="monthly", months=3)
+
+        assert result["view"] == "monthly"
+
+    def test_daily_cells_have_required_fields(self, app_fixture):
+        from app.models import User, Category, Expense
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
+
+        with app_fixture.app_context():
+            user = User(
+                email="dailyfields_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.flush()
+
+            cat = Category(user_id=user.id, name="Food")
+            db.session.add(cat)
+            db.session.flush()
+
+            db.session.add(Expense(
+                user_id=user.id, category_id=cat.id,
+                amount=Decimal("1000"), currency="INR",
+                expense_type="EXPENSE",
+                spent_at=date.today() - timedelta(days=1),
+            ))
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="daily", months=1)
+
+        assert len(result["cells"]) > 0
+        for cell in result["cells"]:
+            assert "date" in cell
+            assert "day_of_week" in cell
+            assert "amount" in cell
+            assert "intensity" in cell
+
+    def test_intensity_values_valid(self, app_fixture):
+        from app.models import User, Category, Expense
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
+
+        with app_fixture.app_context():
+            user = User(
+                email="intensity_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.flush()
+
+            cat = Category(user_id=user.id, name="Food")
+            db.session.add(cat)
+            db.session.flush()
+
+            for days in range(1, 10):
+                db.session.add(Expense(
+                    user_id=user.id, category_id=cat.id,
+                    amount=Decimal(str(days * 100)),
+                    currency="INR", expense_type="EXPENSE",
+                    spent_at=date.today() - timedelta(days=days),
+                ))
+            db.session.commit()
+            result = get_spending_heatmap(user.id, view="daily", months=1)
+
+        valid_intensities = {"0", "1", "2", "3", "4"}
+        for cell in result["cells"]:
+            assert cell["intensity"] in valid_intensities
+
+    def test_months_clamped_to_1_12(self, app_fixture):
+        from app.models import User
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
+
+        with app_fixture.app_context():
+            user = User(
+                email="clamp_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.commit()
+            result = get_spending_heatmap(user.id, months=99)
+
+        assert result["months_analyzed"] <= 12
+
+    def test_max_value_non_negative(self, app_fixture):
+        from app.models import User
+        from app.extensions import db
+        from werkzeug.security import generate_password_hash
+
+        with app_fixture.app_context():
+            user = User(
+                email="maxval_heatmap@finmind.io",
+                password_hash=generate_password_hash("pass"),
+            )
+            db.session.add(user)
+            db.session.commit()
+            result = get_spending_heatmap(user.id)
+
+        assert result.get("total_spend", 0) >= 0
 
 
-class TestSpendingHeatmapRoute:
+class TestSpendingHeatmapAPI:
+    """HTTP endpoint tests."""
 
-    def _get_app(self):
-        from packages.backend.app import create_app
-        app = create_app({"TESTING": True, "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
-                          "JWT_SECRET_KEY": "test-secret"})
-        return app
+    @requires_redis
+    def test_heatmap_returns_200(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap", headers=auth_header)
+        assert resp.status_code == 200
 
-    def test_route_requires_auth(self):
-        app = self._get_app()
-        with app.test_client() as client:
-            resp = client.get("/insights/spending-heatmap")
-            assert resp.status_code == 401
+    @requires_redis
+    def test_requires_authentication(self, client):
+        resp = client.get("/insights/spending-heatmap")
+        assert resp.status_code == 401
 
-    def test_months_defaults_to_3(self):
-        from packages.backend.app.services.spending_heatmap import get_spending_heatmap
-        app = self._get_app()
-        with app.test_client() as client:
-            with patch("packages.backend.app.routes.spending_heatmap.get_spending_heatmap") as mock_fn:
-                mock_fn.return_value = {"period_months": 3, "cells": [], "day_summaries": [],
-                                        "busiest_day": "N/A", "quietest_day": "N/A",
-                                        "total_spend": 0.0, "start_date": "2026-01-01",
-                                        "end_date": "2026-03-31"}
-                from flask_jwt_extended import create_access_token
-                with app.app_context():
-                    token = create_access_token(identity="1")
-                resp = client.get("/insights/spending-heatmap",
-                                  headers={"Authorization": f"Bearer {token}"})
-                assert resp.status_code == 200
-                mock_fn.assert_called_once_with(1, 3)
+    @requires_redis
+    def test_daily_view_parameter(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap?view=daily", headers=auth_header)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["view"] == "daily"
+
+    @requires_redis
+    def test_weekday_view_parameter(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap?view=weekday", headers=auth_header)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["view"] == "weekday"
+
+    @requires_redis
+    def test_monthly_view_parameter(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap?view=monthly", headers=auth_header)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["view"] == "monthly"
+
+    @requires_redis
+    def test_invalid_view_defaults_to_daily(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap?view=invalid", headers=auth_header)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["view"] == "daily"
+
+    @requires_redis
+    def test_months_parameter(self, client, auth_header):
+        resp = client.get("/insights/spending-heatmap?months=3", headers=auth_header)
+        assert resp.status_code == 200

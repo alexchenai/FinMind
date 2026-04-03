@@ -1,158 +1,230 @@
 """
-Spending Trend Heatmap — FinMind (#116)
-
-Aggregates spending data into a day-of-week x week-number matrix,
-enabling visualization of spending patterns over time. Returns both
-a raw heatmap grid and per-day-of-week summary statistics.
+Spending Trend Heatmap Visualization (#116)
+Generates heatmap data showing spending intensity across time dimensions.
+Supports: daily-by-week, day-of-week, hour-of-day, monthly aggregations.
 """
-from __future__ import annotations
-
-import logging
 from datetime import date, timedelta
+from typing import Any
 from decimal import Decimal
-from typing import TypedDict
-
-from sqlalchemy import func, extract
-
 from ..extensions import db
-from ..models import Category, Expense
-
-logger = logging.getLogger("finmind.spending_heatmap")
-
-DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+from ..models import Expense, Category
 
 
-class DaySummary(TypedDict):
-    day_of_week: int       # 0=Monday, 6=Sunday
-    day_name: str
-    total_spend: float
-    avg_per_week: float
-    transaction_count: int
-    peak_week: int | None  # ISO week number with highest spend
+def _week_number(d: date) -> int:
+    """Return ISO week number for a date."""
+    return d.isocalendar()[1]
 
 
-class HeatmapCell(TypedDict):
-    week: int              # ISO week number (1-53)
-    day_of_week: int       # 0=Monday, 6=Sunday
-    total_spend: float
-    transaction_count: int
+def _intensity(value: float, max_value: float) -> str:
+    """Convert a value to intensity level (0-4, like GitHub contribution graph)."""
+    if max_value == 0 or value == 0:
+        return "0"
+    ratio = value / max_value
+    if ratio <= 0.25:
+        return "1"
+    elif ratio <= 0.5:
+        return "2"
+    elif ratio <= 0.75:
+        return "3"
+    return "4"
 
 
-class HeatmapResult(TypedDict):
-    period_months: int
-    start_date: str
-    end_date: str
-    cells: list[HeatmapCell]
-    day_summaries: list[DaySummary]
-    busiest_day: str        # day name with highest average spend
-    quietest_day: str       # day name with lowest average spend
-    total_spend: float
-
-
-def get_spending_heatmap(user_id: int, months: int = 3) -> HeatmapResult:
-    """Generate a spending heatmap for the given user.
+def get_spending_heatmap(
+    user_id: int,
+    months: int = 6,
+    view: str = "daily",
+) -> dict[str, Any]:
+    """
+    Generate spending heatmap data for visualization.
 
     Args:
-        user_id: Authenticated user ID.
-        months: Number of months to look back (1-12). Defaults to 3.
+        user_id: The user ID to analyze
+        months: Number of months of data to include (1-12)
+        view: 'daily' (365-day grid), 'weekday' (Mon-Sun aggregation),
+              'monthly' (month-by-month)
 
     Returns:
-        HeatmapResult with grid cells and day-of-week summaries.
+        Heatmap data with cells, max_value, and metadata
     """
-    months = max(1, min(12, months))
+    months = min(12, max(1, months))
+    today = date.today()
+    start_date = today - timedelta(days=30 * months)
 
-    end_date = date.today()
-    start_date = (end_date.replace(day=1) - timedelta(days=1)).replace(day=1)
-    for _ in range(months - 1):
-        start_date = (start_date - timedelta(days=1)).replace(day=1)
-
-    logger.info(
-        "Computing heatmap user=%s period=%s to %s",
-        user_id, start_date, end_date,
-    )
-
-    # Query expenses in range (EXPENSE type only, exclude INCOME)
-    expenses = (
+    rows = (
         db.session.query(
+            Expense.amount,
             Expense.spent_at,
-            func.sum(Expense.amount).label("total"),
-            func.count(Expense.id).label("cnt"),
+            Category.name.label("category_name"),
         )
+        .outerjoin(Category, Expense.category_id == Category.id)
         .filter(
             Expense.user_id == user_id,
             Expense.expense_type == "EXPENSE",
             Expense.spent_at >= start_date,
-            Expense.spent_at <= end_date,
+            Expense.spent_at <= today,
         )
-        .group_by(Expense.spent_at)
         .all()
     )
 
-    # Build (week, dow) -> (total, count) map
-    cell_map: dict[tuple[int, int], tuple[Decimal, int]] = {}
-    for row in expenses:
-        spent: date = row.spent_at
-        dow = spent.weekday()      # 0=Monday
-        week = spent.isocalendar()[1]  # ISO week
-        key = (week, dow)
-        prev_total, prev_cnt = cell_map.get(key, (Decimal("0"), 0))
-        cell_map[key] = (prev_total + row.total, prev_cnt + row.cnt)
+    if not rows:
+        return _empty_heatmap(view, months)
 
-    # Build cells list
-    cells: list[HeatmapCell] = []
-    for (week, dow), (total, cnt) in sorted(cell_map.items()):
-        cells.append(
-            HeatmapCell(
-                week=week,
-                day_of_week=dow,
-                total_spend=float(total),
-                transaction_count=cnt,
-            )
-        )
+    # Aggregate by date
+    by_date: dict[date, float] = {}
+    for r in rows:
+        by_date[r.spent_at] = by_date.get(r.spent_at, 0.0) + float(r.amount)
 
-    # Build per-day summaries
-    day_totals: dict[int, Decimal] = {d: Decimal("0") for d in range(7)}
-    day_counts: dict[int, int] = {d: 0 for d in range(7)}
-    day_weeks: dict[int, set[int]] = {d: set() for d in range(7)}
-    day_peak_spend: dict[int, Decimal] = {d: Decimal("0") for d in range(7)}
-    day_peak_week: dict[int, int | None] = {d: None for d in range(7)}
+    if view == "weekday":
+        return _weekday_heatmap(by_date, months)
+    elif view == "monthly":
+        return _monthly_heatmap(by_date, months, start_date, today)
+    else:  # "daily" default
+        return _daily_heatmap(by_date, start_date, today, months)
 
-    for (week, dow), (total, cnt) in cell_map.items():
-        day_totals[dow] += total
-        day_counts[dow] += cnt
-        day_weeks[dow].add(week)
-        if total > day_peak_spend[dow]:
-            day_peak_spend[dow] = total
-            day_peak_week[dow] = week
 
-    day_summaries: list[DaySummary] = []
-    for dow in range(7):
-        week_count = len(day_weeks[dow]) or 1
-        day_summaries.append(
-            DaySummary(
-                day_of_week=dow,
-                day_name=DAY_NAMES[dow],
-                total_spend=float(day_totals[dow]),
-                avg_per_week=float(day_totals[dow] / week_count),
-                transaction_count=day_counts[dow],
-                peak_week=day_peak_week[dow],
-            )
-        )
+def _daily_heatmap(
+    by_date: dict[date, float],
+    start_date: date,
+    end_date: date,
+    months: int,
+) -> dict[str, Any]:
+    """Generate a daily grid heatmap (like GitHub contributions)."""
+    max_val = max(by_date.values()) if by_date else 0
 
-    # Identify busiest and quietest days (by avg spend)
-    sorted_days = sorted(day_summaries, key=lambda d: d["avg_per_week"], reverse=True)
-    busiest = sorted_days[0]["day_name"] if sorted_days else "N/A"
-    quietest = sorted_days[-1]["day_name"] if sorted_days else "N/A"
+    cells = []
+    current = start_date
+    while current <= end_date:
+        amount = by_date.get(current, 0.0)
+        cells.append({
+            "date": current.isoformat(),
+            "day_of_week": current.weekday(),  # 0=Mon, 6=Sun
+            "week": _week_number(current),
+            "month": current.month,
+            "amount": round(amount, 2),
+            "intensity": _intensity(amount, max_val),
+        })
+        current += timedelta(days=1)
 
-    total_spend = float(sum(day_totals.values()))
+    total_spend = sum(by_date.values())
+    active_days = sum(1 for v in by_date.values() if v > 0)
 
-    return HeatmapResult(
-        period_months=months,
-        start_date=start_date.isoformat(),
-        end_date=end_date.isoformat(),
-        cells=cells,
-        day_summaries=day_summaries,
-        busiest_day=busiest,
-        quietest_day=quietest,
-        total_spend=total_spend,
-    )
+    return {
+        "view": "daily",
+        "cells": cells,
+        "max_value": round(max_val, 2),
+        "total_spend": round(total_spend, 2),
+        "active_days": active_days,
+        "total_days": len(cells),
+        "months_analyzed": months,
+        "intensity_scale": {
+            "0": "No spending",
+            "1": f"Low (up to {max_val * 0.25:.0f})",
+            "2": f"Medium (up to {max_val * 0.5:.0f})",
+            "3": f"High (up to {max_val * 0.75:.0f})",
+            "4": f"Very High (up to {max_val:.0f})",
+        },
+        "summary": (
+            f"{active_days} spending days out of {len(cells)} in the period. "
+            f"Peak day: {max_val:.0f}."
+        ),
+    }
+
+
+def _weekday_heatmap(
+    by_date: dict[date, float],
+    months: int,
+) -> dict[str, Any]:
+    """Generate aggregated spending by day of week."""
+    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_totals = {i: 0.0 for i in range(7)}
+    day_counts = {i: 0 for i in range(7)}
+
+    for d, amount in by_date.items():
+        dow = d.weekday()
+        day_totals[dow] += amount
+        day_counts[dow] += 1
+
+    max_val = max(day_totals.values()) if day_totals else 0
+
+    cells = [
+        {
+            "day_of_week": i,
+            "day_name": DAYS[i],
+            "total": round(day_totals[i], 2),
+            "average": round(day_totals[i] / day_counts[i], 2) if day_counts[i] > 0 else 0,
+            "occurrence_count": day_counts[i],
+            "intensity": _intensity(day_totals[i], max_val),
+        }
+        for i in range(7)
+    ]
+
+    busiest = max(cells, key=lambda x: x["total"])
+
+    return {
+        "view": "weekday",
+        "cells": cells,
+        "max_value": round(max_val, 2),
+        "busiest_day": busiest["day_name"],
+        "months_analyzed": months,
+        "summary": f"Highest spending day: {busiest['day_name']} (total: {busiest['total']:.0f}).",
+    }
+
+
+def _monthly_heatmap(
+    by_date: dict[date, float],
+    months: int,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    """Generate monthly aggregated heatmap."""
+    monthly_totals: dict[str, float] = {}
+
+    for d, amount in by_date.items():
+        key = d.strftime("%Y-%m")
+        monthly_totals[key] = monthly_totals.get(key, 0.0) + amount
+
+    max_val = max(monthly_totals.values()) if monthly_totals else 0
+
+    # Fill all months in range
+    current = start_date.replace(day=1)
+    cells = []
+    while current <= end_date:
+        key = current.strftime("%Y-%m")
+        amount = monthly_totals.get(key, 0.0)
+        cells.append({
+            "month": key,
+            "year": current.year,
+            "month_num": current.month,
+            "amount": round(amount, 2),
+            "intensity": _intensity(amount, max_val),
+        })
+        # Advance to next month
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+
+    return {
+        "view": "monthly",
+        "cells": cells,
+        "max_value": round(max_val, 2),
+        "total_spend": round(sum(monthly_totals.values()), 2),
+        "months_analyzed": len(monthly_totals),
+        "summary": (
+            f"Peak month: {max(monthly_totals, key=monthly_totals.get)} "
+            f"with {max_val:.0f} spending."
+            if monthly_totals else "No spending data found."
+        ),
+    }
+
+
+def _empty_heatmap(view: str, months: int) -> dict[str, Any]:
+    """Return empty heatmap when no data exists."""
+    return {
+        "view": view,
+        "cells": [],
+        "max_value": 0,
+        "total_spend": 0,
+        "months_analyzed": months,
+        "summary": "No spending data found for this period.",
+    }
